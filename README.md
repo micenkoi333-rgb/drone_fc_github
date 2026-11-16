@@ -1,98 +1,123 @@
-# drone_fc — симулятор конвертоплана (VTOL-літак з 4 поворотними гвинтами)
+# drone_fc — tilt-rotor VTOL flight physics simulator
 
-Симулятор одного апарата — літака з вертикальним злітом: 4 гвинти 10×4.5″ на **поворотних гондолах** — два посередині консолей крила (тягнучі),
-два на кінцях **V-хвоста** (типово штовхальні: у висінні гвинт під мотором, у польоті — позаду гондоли), прямокутне крило 1.6 × 0.28 м (Clark Y),
-батарея 6S2P 21700 (≈155 Вт·год), злітна маса ≈ 2.28 кг. Окремого маршового мотора немає: у польоті гондоли повертаються на 90° і ті самі гвинти тягнуть уперед.
-Мета — перевірити концепцію до збирання: тяга, енергія, стійкість, переходи, відмови. C++17, Windows, MSVC.
-Що з'ясувалося про саму схему — **`docs/TILTROTOR.md`**.
+A 6-DOF flight physics simulator for small electric **tilt-rotor VTOL aircraft**: four propellers on tilting nacelles that lift the aircraft
+like a quadcopter, then rotate forward so the same propellers drive it as an airplane. The goal is to evaluate a design *before* it is built —
+thrust margins, energy use, stability, hover↔cruise transitions, wind tolerance and failure cases — and to develop the flight controller
+against a model that behaves like real hardware (noisy sensors, delays, servo backlash, battery sag).
 
-Попередній апарат (QuadPlane «Носій субдронів» з маршовим мотором і субдронами) лишився в історії git (гілка `master` до `8d5bcf6`).
+Written in **C++17** (header-only core, no dependencies). The 3D GUI uses Dear ImGui + ImPlot + GLFW (OpenGL). Python is used only for
+offline table generation and neural-network training.
 
-## Збирання й запуск
+Two aircraft are included:
+
+| | `aircraft/qp5.ini` — QP-5 TiltQuad v3 (default) | `aircraft/tiltrotor.ini` — earlier concept |
+|---|---|---|
+| Mass | 2.37 kg | 2.28 kg |
+| Wing | 1.0 m span, tapered with twist, SD7037 | 1.6 × 0.28 m rectangular, Clark Y |
+| Propulsion | 2 × 2216 + 10×7″ (front, tractor), 2 × 2212 + 9×7″ (rear, pusher) | 4 × 10×4.5″ |
+| Tail | horizontal stabilizer + two fixed fins, yaw by differential thrust | V-tail with ruddervators |
+| Battery | 4S3P Li-ion 21700 | 6S2P Li-ion 21700 |
+
+Any aircraft is described by a single INI file (geometry, mass items, motors, propellers, battery, controller gains); the simulator derives
+mass properties, inertia, aerodynamic tables and trim from it.
+
+## Physics model
+
+**Rigid body.** 6-DOF equations of motion integrated with RK4 at 1 kHz; mass, centre of gravity and inertia tensor computed from individual
+mass items; landing gear contact model.
+
+**Aerodynamics.**
+- Wing split into spanwise strips (blade-element / strip theory) with full-range airfoil tables (−180…180°, Selig-style post-stall).
+- Nonlinear lifting-line solution for induced angles (handles taper and twist), downwash at the tail via Biot–Savart.
+- Dynamic stall per strip, wing ground effect, fuselage drag, control surfaces.
+- Propeller slipstream over the wing and tail; rotor-to-rotor wake interaction.
+
+**Propellers and nacelles.**
+- Thrust and torque from UIUC-style CT/CP(J) tables, H-force in oblique inflow, reaction and gyroscopic torques along each nacelle axis.
+- Rotor ground effect and vortex-ring state when the disk faces down; drag of stopped propellers; nacelle blockage for pushers.
+- Tilt servos with rate limits, travel limits and backlash; frame flexibility.
+
+**Power.** Brushless motor + ESC model (with active braking), Thevenin battery model with temperature, implicit bus-voltage solution —
+current, voltage sag and remaining energy come out of the same model.
+
+**Environment.** ISA atmosphere, wind shear with terrain roughness, Dryden turbulence with gust gradients, thermals.
+
+**Sensors.** Either "truth + noise and delays", or raw sensors: two IMUs with vibration and failures, GPS with latency and velocity bias,
+barometer, magnetometer, airspeed, nacelle position feedback — feeding a 15-state EKF.
+
+## Flight controller
+
+ArduPilot-QuadPlane-style architecture: attitude/rate loops, position control, TECS and L1 for airplane flight, blended transitions,
+Q_ASSIST and weathervaning. Tilt-rotor specific: forces are distributed by tilting the nacelles instead of pitching the body, yaw in hover by
+differential nacelle tilt, braking by tilting nacelles backwards. Failsafes: lost GPS / airspeed / link, low battery, motor failure, jammed
+nacelle actuator. Five manual flight modes (keyboard or gamepad).
+
+An optional on-board "AI co-processor" (`ai/`) runs small neural networks next to the controller: an external-force model, a learned
+station-keeping policy, an aerobatics trainer, and health diagnostics (prop damage, actuator backlash, CG shift, battery).
+
+## Validation
+
+- **~480 automated tests** (`tests/`): physics invariants, aerodynamic tables, trim, flight modes, failures, wind, Monte-Carlo runs.
+- QP-5 model vs. the airframe's design documentation:
+
+| | Design doc | Simulator |
+|---|---|---|
+| Mass | 2.370 kg | 2.370 kg |
+| Ixx / Iyy / Izz, kg·m² | 0.039 / 0.207 / 0.244 | 0.040 / 0.198 / 0.237 |
+| Stall speed | 11.7 m/s | 11.6 m/s |
+| Max thrust front / rear | 1422 / 1016 g | 1400 / 1014 g |
+| Drag at 14.6 / 18 / 22 m/s | 2.66 / 2.58 / 2.94 N | 2.58 / 2.61 / 3.08 N |
+| L/D at 14.6 m/s | 8.8 | 9.0 |
+| Hover power | 352 W | 444 W |
+| Cruise power at 14.6 m/s | 78 W | 99 W |
+
+Aerodynamics agrees within 5%. Power differs by ~25% because the propeller data are generic; it will be recalibrated from thrust-stand
+measurements (see `docs/QP5.md`).
+
+- A 1 km QP-5 mission (take-off, transition, cruise, hover, return, landing) completes in calm air and in 3–12 m/s wind from all four
+  directions, landing within 5 m of home.
+
+## Build and run (Windows, Visual Studio)
 
 ```bat
-build.bat            :: консольний симулятор, тести й вікно (drone_gui.exe); `build.bat nolaunch` — без запуску
-build_gui.bat        :: лише графічний інтерфейс (бібліотеки ImGui/ImPlot збираються один раз у build\imgui_implot.lib)
-run_tests.bat        :: збирає тести й ганяє всі групи паралельно на всіх ядрах (8 ядер ≈ 13 хв; вивід — tests_out\)
-run_tests.exe        :: тести по черзі на одному ядрі
-drone_sim.exe aircraft            :: параметри апарата, маси, ЦМ, інерція, перевірки
-drone_sim.exe qp trim             :: тримування (9–20 м/с) і перехід (нахил гондол за швидкістю)
-drone_sim.exe qp modes [V]        :: власні значення мод польоту
-drone_sim.exe qp mission          :: енергія місії
+build.bat            :: console simulator, tests and GUI (drone_gui.exe)
+build_gui.bat        :: GUI only
+run_tests.bat        :: all test groups in parallel on all CPU cores
+drone_sim.exe aircraft          :: mass properties, CG, inertia, checks
+drone_sim.exe qp trim           :: trim table (airplane) and transition schedule
+drone_sim.exe qp modes [V]      :: eigenvalues of the flight modes
+drone_sim.exe qp mission        :: mission energy estimate
 ```
 
-Запускати з кореня проєкту (шляхи `aircraft/…` відносні). Потрібні: Visual Studio з C++ (шлях у `build.bat`), Python 3 лише для перегенерації таблиць профілю (`tools/aero_gen.py`).
+Run from the project root. The core and tests also compile with g++ (`g++ -std=c++17 -O2 -I. tests/test_main.cpp -lpthread`).
+The active aircraft is set in `aircraft/active.txt` or in the GUI (Parameters → Aircraft).
 
-## Вікно (`drone_gui.exe`)
+Speed: a 120 s flight takes ~9 s on one core (~13× real time); batch runs (mission check in 17 wind conditions, tests, AI training)
+use all cores.
 
-3D-вид (гондоли повертаються, видно диски гвинтів і рулі V-хвоста; камери: за апаратом, орбітальна, з землі, згори, з борту), PFD, карта, графіки, панелі:
-- **Керування**: Старт/Пауза, Скинути, швидкість часу, відстань до цілі, висоти, **скільки висіти над ціллю**, **схема задніх гвинтів** (штовхальні / тягнучі),
-  **хто тягне в польоті** (передні / усі 4 / передні + задні на допомогу), вітер на 6 м (до 12 м/с), турбулентність, місцевість, шум датчиків, EKF, термічні потоки,
-  Q_WVANE, тяга нахилом гондол у висінні, динамічний зрив, ефекти гвинтів; журнал CSV, відтворення, знімок екрана.
-- **ШІ-співпроцесор** (`ai/`, `docs/AI.md`): нейромережі на чистому C++ (float / int8, GRU), протокол з польотним контролером і сторож, діагностика вібрацій гвинтів, люфту приводів нахилу й батареї з повідомленнями людині; експорт ваг з PyTorch — `tools/ai_export.py`; **модель сил** — нейромережа з пам'яттю 1 с і самоперевіркою, що допомагає контролеру у висінні, з вантажем і без (автопілот сам оцінює масу) (у вітрі 9 м/с висота тримається вдвічі точніше), навчання — `tools/ai_datagen.cpp` + `tools/ai_train.py`
-- **Пілотажні трюки й «Мозок ШІ»** (`fc/qp_tricks.h`, `sim/qp_tricks.h`, `gui/brain_view.h`, `docs/AI.md`): ШІ вчиться (метод перехресної ентропії, на своєму комп'ютері — GUI → «Трюки» або `train_tricks.bat`) мертвої петлі, звалювання, векторної бочки, хамерхеда, «Харрієра» (гальмування гондолами, пірует, старт), кобри, сальто з висіння й «втрати керування» (кульбіти з вимкненими моторами й порятунок); «Авіашоу аса» — усі вісім поспіль. Вікно «Мозок ШІ» (клавіша B) показує, що ШІ пробує під час навчання, що робить і чому в польоті, і живі нейрони мережі сил з доказом її впливу
-- **Ручне керування**, 5 режимів (F1–F5): асистований (QLOITER), QSTABILIZE, QACRO, FBWA, MANUAL — включно з ручним переходом у літак (**V** — перемикач коптер ↔ літак, F4/F5 — режими літака, T/G — гондоли вперед/назад)
-  (T/G — нахил гондол уперед у коптерних режимах); клавіатура або геймпад «режим 2» (`docs/CONTROL.md`).
-- **Стан** (режим, «УВАГА», EKF/IMU/VIBE, кути гондол, батарея, мотори, рулі V-хвоста, вітер), **Відмови** (мотори, **приводи гондол**, рулі, GPS, Піто, батарея, IMU, вібрації).
-- **Параметри апарата**: редагування `tiltrotor.ini` за розділами, «Застосувати» (новий політ), «Зберегти» (з копією `.bak`).
-- **Довідка** (H), **підказка** над 3D-видом, **звук** (гул кожного гвинта за обертами, вітер, тривога).
-- **Звіт про політ** (сам після посадки/аварії): підсумок, 18 графіків (зокрема **кути гондол**), карта; файли `flight_NNN.txt`, `.csv` (39 величин, 10 Гц) і
-  **`flight_NNN.html`** — звіт для браузера з графіками, картою й кнопкою «Скачати CSV».
+## GUI (`drone_gui.exe`)
 
-Місія за замовчуванням: зліт на 30 м → гондоли вперед, перехід у літак → політ до цілі (1 км) → гондоли назад, висіння над ціллю 20 с → повернення → посадка.
+3D view with tilting nacelles and spinning disks, several cameras, PFD, map and live plots; mission and environment settings,
+fault injection, manual flight, parameter editor, flight reports (TXT, CSV, interactive HTML), "check mission in different winds" on all cores.
 
-## Що змодельовано
+## Known limitations
 
-- **Аеродинаміка** за схемою Селіга: крило по 24 смугах, таблиці профілю на −180…180°, нелінійна підйомна лінія, **нижнє заднє крило** з рулем висоти й **малий V-хвіст** (дві панелі під 40°, рулі
-  висота/напрям змішуються), скіс потоку (Біо–Савар), опір корпусу; перевірка, що диски гвинтів у всьому діапазоні нахилу не перетинають конструкцію (≥ 2 см); **слід кожного гвинта** вздовж його осі (у висінні — вниз, у польоті — назад на крило й хвіст),
-  динамічний зрив, ефект землі крила. 6DOF, RK4, 1 кГц.
-- **Гондоли**: привід нахилу 90°/с (−25…92°: нахил назад — гальмування), тяга, H-сила, реактивний момент і гіроскопічний момент — уздовж осі гондоли; штовхальний гвинт у затіненні
-  гондоли (−6% тяги); **зупинений гвинт дає опір** (задні в польоті). Ефект землі й вихрове кільце — лише коли диск дивиться вниз.
-- **Гвинти й живлення**: таблиці UIUC CT/CP(J), мотор + ESC з активним гальмуванням, батарея Тевенена з температурою, неявна напруга шини.
-- **Середовище**: ISA, вітер зі зсувом, турбулентність Драйдена з градієнтами поривів, термічні потоки, шасі TPU (дві ніжки під гондолами + хвостова опора).
-- **Датчики й оцінювач**: «правда + шум і затримки» або сирі датчики (2 IMU з вібраціями й відмовами, GPS, баро, компас) → EKF (15 станів, дві смуги),
-  **датчик положення приводу кожної гондоли**.
-- **Контролер** (`docs/CONTROL.md`): VTOL-регулятори, TECS, L1, переходи з blend, Q_ASSIST, Q_WVANE, **розподіл сил нахилом гондол** (кут кожної гондоли =
-  atan2(сила вперед, сила вгору)), **рискання у висінні різницевим нахилом гондол** (у 10 разів сильніше за реактивний момент), тяга вперед/назад нахилом гондол
-  замість нахилу корпусу; аварійні режими: тайм-аути, низька напруга, GPS, Піто, відмова мотора (посадка з обертанням або літаком), **заклинений привід гондоли**.
+- Propeller and motor data are generic (UIUC-style), not measured — the biggest source of error in power and endurance.
+- SD7037 airfoil table is an approximation; landing gear, frame stiffness and servo speed are estimates.
+- Oblique-inflow propeller model is axial + H-force, no blade-resolved aerodynamics.
 
-## Ключові числа (2.28 кг, ISA)
+## Repository layout
 
-| Параметр | Значення |
-|---|---|
-| Звалювання | 8.2 м/с (CLmax 1.2) |
-| Висіння | 312 Вт (4 гвинти по 5.6 Н, ≈ 5550 об/хв) |
-| Перехід | гондоли 12° на 5 м/с, 24° на 8 м/с, 32° на 9 м/с — потужність падає з 312 до 115 Вт |
-| Крейсер 15 м/с | тягнуть лише передні — **131 Вт**, усі 4 — 179 Вт (гвинти для висіння на крейсері навантажені слабко) |
-| Тільки крейсер | ≈ 70 хв, ≈ 63 км (передні); ≈ 50 хв, 45 км (усі 4) |
-| Моди (15 м/с) | короткий період ωn 11 рад/с ζ 0.73; фугоїда ωn 1.3 ζ 0.37; голландський крок ωn 6.1 ζ 0.25; спіраль майже нейтральна |
+```
+aircraft/   aircraft definitions (INI) and airfoil tables (JSON)
+sim/        physics: aerodynamics, propellers, battery, sensors, environment, rigid body
+fc/         flight controller: modes, control loops, EKF, failsafes, logging
+ai/         on-board neural networks and diagnostics
+gui/        ImGui / OpenGL front end
+tools/      airfoil table generator, AI training, ArduPilot SITL bridge
+tests/      automated tests
+docs/       design notes (in Ukrainian)
+third_party/ GLFW, Dear ImGui, ImPlot
+```
 
-## Тести
-
-`run_tests.exe [прогони_МК] [фільтр]` — другий аргумент запускає лише групи з цим рядком у назві (напр. `run_tests.exe 12 Faults`), `=назва` — рівно одну групу, `-j N` — усі групи паралельно на N ядрах (0 — усі).
-Випадкові числа (вітер, пориви, шуми) — `sim/portable_rng.h`, однакові на MSVC і g++; самі польоти на різних компіляторах усе одно трохи розходяться (інші sin/cos/pow), тому межові перевірки рахуються на кількох вітрах (медіана або сума).
-Групи апарата: дані, таблиці, аеродинаміка (+ V-хвіст, слід гвинтів), гвинти/батарея, повна модель (+ привід гондол), аналіз, контролер, аварійні режими,
-ручне керування, відмови (14 обов'язкових — посадка, зокрема заклинені приводи гондол), сильний вітер (9 і 10 м/с), EKF, **конвертоплан** (`testTiltrotor`:
-гондоли в кожному режимі, штовхальні проти тягнучих, крейсер 4 чи 2 гвинтами, запас рискання, вітер 8 м/с), Монте-Карло (12 прогонів).
-
-## Перенесення на залізо
-
-Датчики й приводи за замовчуванням — як на справжньому апараті; армування, геозона, втрата пульта, захист трюків, бортовий журнал,
-параметри з файлу, міст до ArduPilot SITL — `docs/TRANSFER.md`.
-
-## Обмеження моделі (чесно)
-
-- Креслення конвертоплана немає: геометрія гондол, V-хвоста, маси приводів нахилу — припущення [О] (`aircraft/tiltrotor.ini`).
-- Затінення штовхального гвинта гондолою (−6%), опір зупиненого гвинта, амплітуди вихрового кільця — оцінки; гвинт у перехідному косому потоці — модель
-  осьова + поперечна H-сила (без докладної моделі лопаті).
-- Відмова мотора у висінні переживається лише завдяки прямокутному розташуванню гвинтів (задні так само широко, як передні) і ціною обертання; до вітру ≈ 4–6 м/с.
-- Перехід у коптер повільний (≈ 20 с на кожен): гальмування коптером після переходу — найдовша частина місії.
-
-## Структура
-
-`aircraft/` — дані (`tiltrotor.ini`, `aero_tables.json`) · `sim/` — модель (`qp_*.h`, приводи `qp_servo.h`, міст ArduPilot `sitl_json.h`) ·
-`fc/` — контролер: типи `qp_types.h`, режими `qp_mission.h` (нагляд за моторами, гондолами й масою — `qp_monitors.h`, ручне керування — `qp_manual_ctl.h`), регулятори `qp_control.h`, EKF `qp_ekf.h`, відмова мотора `qp_motor_fail.h`,
-безпека `qp_safety.h`, журнал `qp_log.h`, параметри `qp_params.h`, системи координат `frames.h` ·
-`ai/` — бортовий ШІ: мережа сил `force_model.h`, порадник `force_advisor.h`, діагностика `health_monitor.h` ·
-`gui/` — інтерфейс · `tools/aero_gen.py` — таблиці профілю · `third_party/` — GLFW, ImGui, ImPlot · `docs/` — `TILTROTOR.md`, `CONTROL.md`, `AERO_MODEL.md`, `PROGRESS.md` · `tests/` — тести.
-Назви класів і файлів з префіксом `Qp` лишилися від QuadPlane — модель та сама, змінилася схема гвинтів.
+Documentation in `docs/` and the original README (`README_uk.md`) are in Ukrainian.

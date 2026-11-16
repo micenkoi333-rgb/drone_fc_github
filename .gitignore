@@ -1,0 +1,27 @@
+*.exe
+*.obj
+*.pdb
+*.wav
+run_tests.exe
+
+build/
+drone_gui.ini
+flight_log.csv
+# звіти й журнали польотів, знімки екрана (створює drone_gui.exe)
+flight_*.txt
+flight_*.csv
+shot_*.bmp
+*.bak
+flight_*.html
+data/
+tests_out/
+
+# службове: Python, Visual Studio, проміжні файли навчання
+v/
+__pycache__/
+*.pyc
+*.lib
+!third_party/glfw/lib/glfw3.lib
+*.exp
+*.ilk
+*.cur
